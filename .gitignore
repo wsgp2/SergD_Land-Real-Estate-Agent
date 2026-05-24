@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pyenv/
+
+# Local data & databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs & artifacts
+*.log
+*.csv
+*.dump
+*.sql
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+ground_finder_key*
+*_secret*
+secrets/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Vendor binaries (not committed)
+agent_v*_windows_*/
+*.exe
+*.dll
