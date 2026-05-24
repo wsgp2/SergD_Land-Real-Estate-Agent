@@ -105,6 +105,7 @@
 | **Антибот-скрапинг** | [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) — стелс-Chromium с C++-патчами фингерпринтов. Drop-in замена Playwright. Пробивает Cloudflare Turnstile, FingerprintJS, BrowserScan. Без него весь ЦИАН недоступен с 2025 года. |
 | **LLM-извлечение** | Anthropic [Claude Sonnet 4.6](https://www.anthropic.com/claude/sonnet) (`claude-sonnet-4-6`) через `tool_use` со строгой JSON-схемой. Prompt caching на system + tool schema (4425 токенов кешируются один раз, дальше читаются за 10% цены). |
 | **Кадастр** | [`rosreestr2coord`](https://github.com/rendrom/rosreestr2coord) для запросов к ПКК Росреестра. По 38/68 кадастров отдаёт полные данные с координатами полигона и атрибутами ЕГРН; 30/68 — гарантированно отсутствуют в старом ПКК (пробуем НСПД отдельно, в roadmap). |
+| **Геокодинг** | [**DaData**](https://dadata.ru) — российский геокодер. Уделывает Nominatim в РФ: **206/264 (78%)** против **10/274 (4%)** на наших данных. Знает СНТ, ДНП, КП, садовые товарищества — то чего OSM в России почти не знает. 10k запросов/день бесплатно. Конфиг через `qc_geo ≤ 2` (принимаем только точные / уличные / уровень НП — грубее не годится для drive_time). |
 | **Хранилище** | SQLite (`data/listings.db`) — лёгкое, файловое, дедуп по `PRIMARY KEY (source, external_id)`. Все LLM-данные складываются в JSON-колонку `llm_extraction` без миграций. |
 | **Прокси** | xray VLESS-Reality (Frankfurt) для доступа к `api.anthropic.com` с RU IP (Anthropic блокирует РФ). Конфиг в `.env`, не в репо. |
 | **Параллелизм** | `ThreadPoolExecutor` — 5 потоков для LLM (упирается в rate limits), 8 потоков для Росреестра. |
@@ -138,21 +139,33 @@ SearchCriteria(
 )
 ```
 
-### Запуск
+### Запуск (полный пайплайн)
 
 ```bash
 # 1. Собрать объявления с ЦИАН (нужен CloakBrowser, ставится автоматом первым запуском)
 ground-finder fetch --pages 17 --area-min 700 --area-max 1300 --drive 25 --skip-rosreestr
 
-# 2. LLM-извлечение (нужен Anthropic API + прокси из РФ)
+# 2. LLM-извлечение 22 структурированных полей (нужен Anthropic API + прокси из РФ)
 python scripts/llm_extract_batch.py
 
-# 3. Обогащение Росреестром (новые кадастры из LLM)
+# 3. Обогащение Росреестром (координаты + ВРИ + кадастровая стоимость)
 python scripts/reenrich_rosreestr.py
 
-# 4. Финальный отчёт
+# 4. Геокодинг адресов без кадастра через DaData (главный буст покрытия)
+python scripts/geocode_dadata.py
+
+# 5. Финальный отчёт + Leaflet карта + JSON шорт-лист
 python scripts/report.py
+
+# 6. Экспорт топа для Telegram (HTML с тегами + plain с Unicode-bold)
+python scripts/export_top.py --drive 15 --area-min 6 --area-max 14
+# → data/top_15min.txt   (для копипаста в любой Telegram)
+# → data/top_15min.html  (для бота с parse_mode=HTML)
 ```
+
+`export_top.py` автоматически отсеивает явно коммерческие объявления (по
+`vri` и по тексту summary: «ТРЦ», «МКД», «многоэтаж», «офис», «склад»),
+оставляет только листинги без `red_flags`, сортирует по времени езды.
 
 ### Прокси для Anthropic из РФ
 
@@ -228,8 +241,28 @@ ground_finder/
 scripts/
 ├── llm_extract_batch.py     # этап 5: прогон Sonnet по всей БД
 ├── reenrich_rosreestr.py    # этап 6: обогащение Росреестром
-└── report.py                # этап 8: финальный шорт-лист
+├── geocode_dadata.py        # этап 6+: геокодинг адресов через DaData (primary)
+├── geocode_yandex.py        # этап 6+: альтернатива через Yandex Geocoder
+├── geocode_fallback.py      # этап 6+: альтернатива через Nominatim
+├── report.py                # этап 8: финальный шорт-лист + Leaflet карта
+└── export_top.py            # этап 9: экспорт в Telegram-форматах
 ```
+
+## Реальные цифры с тестового прогона (Екатеринбург)
+
+```
+ВОРОНКА:
+  ЦИАН выдал                              454 земельных участка
+  CloakBrowser собрал (17 страниц)        425
+  Нормализация + дедуп                    354 уникальных
+  Sonnet 4.6 извлечение (22 поля)         336 (95% покрытие, $4.52)
+  С координатами после Rosreestr+DaData   280
+  В 25-минутной зоне от якоря             153
+  Чистая группа A (6-14 сот, без флагов)  77
+  Топ-15 минут после фильтра коммерции    24
+```
+
+Стоимость одного полного прогона: **~$5** (Sonnet API). CloakBrowser, Росреестр, DaData, Nominatim — бесплатно в наших объёмах.
 
 ---
 
