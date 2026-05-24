@@ -1,10 +1,9 @@
-"""Финальный отчёт + интерактивная HTML-карта.
+"""Финальный отчёт + интерактивная HTML-карта + JSON шорт-лист.
 
-Шорт-лист отфильтрован по:
-  - drive_time ≤ N мин от якоря
-  - area_sotka в диапазоне
-  - ВРИ из allowed
-  - red_flags пустой (или их нет)
+Три группы кандидатов:
+  A. С точными координатами (Rosreestr или Nominatim) и в drive_window
+  B. Без координат, но LLM city='Екатеринбург' (внутри ГО ≈ ≤25 мин)
+  C. Пригороды (Берёзовский, Арамиль, Сысерть, Верхняя Пышма и др.)
 
 Использование:
     python scripts/report.py [path/to/listings.db]
@@ -19,80 +18,141 @@ from pathlib import Path
 from ground_finder.config import DEFAULT
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "data/listings.db"
+ANCHOR_CITY = "Екатеринбург"
 
 
 def main() -> None:
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
 
+    _print_summary(conn)
+    group_a = _query_group_a(conn)
+    group_b = _query_group_b(conn)
+    group_c = _query_group_c(conn)
+
+    print(f"=== A — с точным drive_time, ≤25 мин, 6-14 сот, без red_flags: {len(group_a)} ===\n")
+    for r in group_a:
+        print(_fmt_row(r, show_drive=True))
+
+    print(f"\n=== B — внутри Екб без координат, 6-14 сот, без red_flags: {len(group_b)} ===")
+    print("(почти гарантированно внутри 25 мин, точное время неизвестно)\n")
+    for r in group_b[:30]:
+        print(_fmt_row(r, show_drive=False))
+    if len(group_b) > 30:
+        print(f"  ... и ещё {len(group_b) - 30} (все в data/shortlist.json)\n")
+
+    print(f"\n=== C — пригороды, 6-14 сот, без red_flags: {len(group_c)} ===\n")
+    for r in group_c[:15]:
+        print(_fmt_row(r, show_drive=False, show_city=True))
+
+    # Сохраняем всё
+    payload = {
+        "a_with_coords": [_to_dict(r) for r in group_a],
+        "b_inside_city_no_coords": [_to_dict(r) for r in group_b],
+        "c_suburbs": [_to_dict(r) for r in group_c],
+    }
+    out_json = Path("data/shortlist.json")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    print(f"\n💾 Full shortlist (A:{len(group_a)} + B:{len(group_b)} + C:{len(group_c)}) → {out_json}")
+
+    out_html = Path("data/map.html")
+    out_html.write_text(_render_map(group_a))
+    print(f"🗺  Interactive map (group A only, координаты есть) → {out_html}")
+
+
+def _print_summary(conn: sqlite3.Connection) -> None:
     total = conn.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"]
     with_llm = conn.execute("SELECT COUNT(*) c FROM listings WHERE llm_extraction IS NOT NULL").fetchone()["c"]
     with_coords = conn.execute("SELECT COUNT(*) c FROM listings WHERE lat IS NOT NULL").fetchone()["c"]
-    in_25 = conn.execute("SELECT COUNT(*) c FROM listings WHERE est_drive_min<=25").fetchone()["c"]
-    in_20 = conn.execute("SELECT COUNT(*) c FROM listings WHERE est_drive_min<=20").fetchone()["c"]
-    in_15 = conn.execute("SELECT COUNT(*) c FROM listings WHERE est_drive_min<=15").fetchone()["c"]
-    izhs = conn.execute(
-        "SELECT COUNT(*) c FROM listings WHERE json_extract(llm_extraction, '$.vri')='ИЖС'"
-    ).fetchone()["c"]
     flagged = conn.execute(
         "SELECT COUNT(*) c FROM listings WHERE "
         "json_array_length(json_extract(llm_extraction, '$.red_flags')) > 0"
     ).fetchone()["c"]
-
+    izhs = conn.execute(
+        "SELECT COUNT(*) c FROM listings WHERE json_extract(llm_extraction, '$.vri')='ИЖС'"
+    ).fetchone()["c"]
     print("=== SUMMARY ===")
-    print(f"Total in DB:           {total}")
-    print(f"With LLM extraction:   {with_llm}")
-    print(f"With coords:           {with_coords}")
-    print(f"With red_flags:        {flagged}")
-    print(f"ИЖС:                   {izhs}")
-    print(f"Within 25 min:         {in_25}")
-    print(f"Within 20 min:         {in_20}")
-    print(f"Within 15 min:         {in_15}")
+    print(f"Всего в БД:             {total}")
+    print(f"С LLM-извлечением:      {with_llm}")
+    print(f"С координатами:         {with_coords}")
+    print(f"С red_flags:            {flagged}")
+    print(f"ИЖС (по LLM):           {izhs}")
     print()
 
-    # Шорт-лист: ≤25 мин, 6-14 сот, ИЖС или ЛПХ, без red_flags
-    shortlist = list(conn.execute(
-        """SELECT l.*, json_extract(llm_extraction, '$.short_summary') summary,
-                  json_extract(llm_extraction, '$.vri') llm_vri,
-                  json_extract(llm_extraction, '$.full_address') llm_address,
-                  json_extract(llm_extraction, '$.has_gas') has_gas,
-                  json_extract(llm_extraction, '$.has_electricity') has_electricity,
-                  json_extract(llm_extraction, '$.has_house') has_house,
-                  json_extract(llm_extraction, '$.red_flags') flags_json,
-                  json_extract(llm_extraction, '$.seller_type') seller
-           FROM listings l
+
+def _query_group_a(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        """SELECT * FROM listings
            WHERE est_drive_min IS NOT NULL AND est_drive_min<=25
              AND area_sotka BETWEEN 6 AND 14
              AND (json_array_length(json_extract(llm_extraction, '$.red_flags'))=0
                   OR json_extract(llm_extraction, '$.red_flags') IS NULL)
-           ORDER BY est_drive_min ASC LIMIT 30"""
+           ORDER BY est_drive_min ASC"""
     ))
 
-    print(f"=== SHORTLIST: {len(shortlist)} clean listings within 25 min, 6-14 sot, no red flags ===\n")
-    for r in shortlist[:15]:
-        utils = []
-        if r["has_gas"]: utils.append("газ")
-        if r["has_electricity"]: utils.append("электр.")
-        if r["has_house"]: utils.append("дом")
-        utils_str = ", ".join(utils) if utils else "—"
-        print(f"  ⏱  {r['est_drive_min']:5.1f}min | 📐 {r['area_sotka']:5.1f} сот | "
-              f"💰 {(r['price_rub'] or 0):>10,}₽ | 🏷 {r['llm_vri'] or '?'} | 🔌 {utils_str}")
-        if r["summary"]:
-            print(f"          {r['summary']}")
-        print(f"          📍 {r['llm_address']}")
-        print(f"          🔗 {r['url']}\n")
 
-    # Сохраним JSON всего шорт-листа
-    out_json = Path("data/shortlist.json")
-    out_json.write_text(
-        json.dumps([dict(r) for r in shortlist], ensure_ascii=False, indent=2, default=str)
+def _query_group_b(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        """SELECT * FROM listings
+           WHERE lat IS NULL
+             AND json_extract(llm_extraction, '$.city')=?
+             AND area_sotka BETWEEN 6 AND 14
+             AND (json_array_length(json_extract(llm_extraction, '$.red_flags'))=0
+                  OR json_extract(llm_extraction, '$.red_flags') IS NULL)
+           ORDER BY price_rub ASC""",
+        (ANCHOR_CITY,),
+    ))
+
+
+def _query_group_c(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        """SELECT * FROM listings
+           WHERE lat IS NULL
+             AND json_extract(llm_extraction, '$.city') != ?
+             AND json_extract(llm_extraction, '$.city') IS NOT NULL
+             AND area_sotka BETWEEN 6 AND 14
+             AND (json_array_length(json_extract(llm_extraction, '$.red_flags'))=0
+                  OR json_extract(llm_extraction, '$.red_flags') IS NULL)
+           ORDER BY price_rub ASC""",
+        (ANCHOR_CITY,),
+    ))
+
+
+def _to_dict(r: sqlite3.Row) -> dict:
+    d = dict(r)
+    if d.get("llm_extraction"):
+        try:
+            d["llm_extraction"] = json.loads(d["llm_extraction"])
+        except Exception:
+            pass
+    if d.get("raw_json"):
+        d.pop("raw_json", None)
+    return d
+
+
+def _fmt_row(r: sqlite3.Row, *, show_drive: bool = True, show_city: bool = False) -> str:
+    llm = json.loads(r["llm_extraction"] or "{}")
+    flags = llm.get("red_flags") or []
+    flag_str = f" ⚠ {'; '.join(flags)}" if flags else ""
+    utils = []
+    if llm.get("has_gas"): utils.append("газ")
+    if llm.get("has_electricity"): utils.append("свет")
+    if llm.get("has_water"): utils.append("вода")
+    if llm.get("has_house"): utils.append("дом")
+    if llm.get("has_banya"): utils.append("баня")
+    utils_str = ", ".join(utils) if utils else "—"
+    drive = f"{r['est_drive_min']:5.1f}min" if show_drive and r["est_drive_min"] else "  ?  "
+    addr = llm.get("full_address") or r["address"] or ""
+    city_prefix = f"  📍 {llm.get('city')}\n" if show_city else ""
+    return (
+        city_prefix +
+        f"  {drive} | {(r['area_sotka'] or 0):5.1f} сот | "
+        f"💰 {(r['price_rub'] or 0):>10,}₽ | 🏷 {(llm.get('vri') or '?'):>5} | 🔌 {utils_str}\n"
+        f"          {llm.get('short_summary', '')}{flag_str}\n"
+        f"          📍 {addr}\n"
+        f"          🔗 {r['url']}\n"
     )
-    print(f"Full shortlist ({len(shortlist)}) saved to {out_json}")
-
-    # HTML-карта Leaflet
-    out_html = Path("data/map.html")
-    out_html.write_text(_render_map(shortlist))
-    print(f"Interactive map saved to {out_html}")
 
 
 def _render_map(rows) -> str:
@@ -100,13 +160,14 @@ def _render_map(rows) -> str:
     for r in rows:
         if r["lat"] is None:
             continue
-        summary = (r["summary"] or "").replace("'", "\\'")
-        addr = (r["llm_address"] or "").replace("'", "\\'")
+        llm = json.loads(r["llm_extraction"] or "{}")
         points.append({
             "lat": r["lat"], "lon": r["lon"],
             "price": r["price_rub"], "area": r["area_sotka"],
-            "drive": r["est_drive_min"], "vri": r["llm_vri"],
-            "url": r["url"], "summary": summary, "addr": addr,
+            "drive": r["est_drive_min"], "vri": llm.get("vri"),
+            "url": r["url"],
+            "summary": (llm.get("short_summary") or "").replace("'", "\\'"),
+            "addr": (llm.get("full_address") or "").replace("'", "\\'"),
         })
 
     return f"""<!DOCTYPE html>
@@ -123,10 +184,9 @@ const map = L.map('map').setView(anchor, 11);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
     maxZoom: 19, attribution: '© OpenStreetMap'
 }}).addTo(map);
-L.marker(anchor, {{title: 'Анкор'}}).addTo(map)
-  .bindPopup('<b>Анкор:</b> {DEFAULT.anchor_label}');
+L.marker(anchor).addTo(map).bindPopup('<b>Анкор:</b> {DEFAULT.anchor_label}');
 L.circle(anchor, {{radius: {int(DEFAULT.max_road_km * 1000)}, color:'#888', fillOpacity:0.05}})
-  .addTo(map).bindPopup('Радиус {DEFAULT.max_drive_minutes} мин ({DEFAULT.max_road_km:.1f} км по дорогам)');
+  .addTo(map).bindPopup('Радиус {DEFAULT.max_drive_minutes} мин ({DEFAULT.max_road_km:.1f} км)');
 points.forEach(p => {{
     const color = p.vri === 'ИЖС' ? 'green' : (p.vri === 'ЛПХ' ? 'orange' : 'blue');
     const m = L.circleMarker([p.lat, p.lon], {{radius: 8, color, fillOpacity: 0.7}}).addTo(map);
