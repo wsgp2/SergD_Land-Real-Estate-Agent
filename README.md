@@ -184,16 +184,24 @@ python scripts/llm_extract_batch.py
 - [x] CLI: `ground-finder fetch / show`
 - [x] Шорт-лист с короткими резюме под каждый листинг
 
+- [x] Nominatim fallback для объявлений без кадастра (геокодинг по `full_address` из LLM)
+- [x] Leaflet HTML-карта с пинами и фильтрами (`data/map.html` после `scripts/report.py`)
+
 ### 🛠 Roadmap
 
+- [ ] **Yandex Geocoder** вместо Nominatim — OSM плохо знает СНТ/ДНП/КП в РФ (10/274 успешных в нашем тесте). Yandex даёт точность ≈ 90% по тем же адресам.
 - [ ] Авито (через CloakBrowser, тот же подход)
 - [ ] Земля ДОМ.РФ — государственные земельные аукционы
-- [ ] Nominatim fallback для объявлений без кадастра (геокодинг по `full_address` из LLM)
 - [ ] НСПД API (новая платформа Росреестра) — добрать кадастры, которых нет в старом ПКК
 - [ ] Yandex Routing API — реальное время в пути с учётом пробок
 - [ ] Sonnet-скоринг 0–100 под профиль покупателя («дом + баня + огород, газ обязательно»)
-- [ ] Leaflet HTML-карта с пинами и фильтрами
 - [ ] Telegram-бот для уведомлений о новых попадающих под фильтр объявлениях
+
+### 💡 Заметки эксплуатации
+
+- **Anthropic rate limit.** На Tier 1 (8k OTPM Sonnet) при `WORKERS=5` упираемся в лимит и SDK замедляется до ~0.2 листинга/сек. На 354 листинга это ~25 минут и ~$4.5. Снизь `WORKERS` до 2-3 если упираешься; или повысь tier в [Anthropic Console](https://console.anthropic.com/settings/limits).
+- **CloakBrowser** ставит свой Chromium-бинарь (~200MB) при первом запуске в `~/.cache/cloakbrowser/`. Никаких системных пакетов не трогает.
+- **Anthropic из РФ.** `api.anthropic.com` отвечает 403 на RU IP, нужен прокси (см. секцию «Прокси для Anthropic из РФ»). А вот `cian.ru` наоборот удобнее парсить с RU IP — Cloudflare капризнее на не-российских.
 
 ---
 
